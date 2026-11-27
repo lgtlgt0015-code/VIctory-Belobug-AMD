@@ -557,6 +557,11 @@ fn small_float(bits: u32, man: u32) -> f32 {
     }
 }
 
+fn shared_exponent_rgb(word: u32) -> [f32; 3] {
+    let multiplier = 2f32.powi((word >> 27) as i32 - 24);
+    [0, 9, 18].map(|shift| ((word >> shift) & 0x1ff) as f32 * multiplier)
+}
+
 /// Converts host-format rows to opaque 8-bit RGBA for the RGB dump. Byte
 /// colors and packed 16-bit BGR use their full channel range. Other formats
 /// scale to the highest finite value, with single channels shown in grey
@@ -616,6 +621,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             let v = u32_at(b, 0);
             [(v & 0x3ff) as f32, (v >> 10 & 0x3ff) as f32, (v >> 20 & 0x3ff) as f32]
         })),
+        67 => (4, Box::new(move |b| shared_exponent_rgb(u32_at(b, 0)))),
         26 => (4, Box::new(move |b| {
             let v = u32_at(b, 0);
             [small_float(v & 0x7ff, 6), small_float(v >> 11 & 0x7ff, 6), small_float(v >> 22, 5)]
@@ -681,10 +687,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             for x in 0..w {
                 let v = u32_at(px(x, y, 4), 0);
                 set += usize::from(v != 0);
-                let scale = 2f32.powi((v >> 27) as i32 - 24);
-                for k in 0..3 {
-                    packed_high = packed_high.max((v >> (9 * k) & 0x1ff) as f32 * scale);
-                }
+                packed_high = shared_exponent_rgb(v).into_iter().fold(packed_high, f32::max);
             }
         }
         let nonzero_bits_percent = set as f32 * 100.0 / (w * h).max(1) as f32;
@@ -870,6 +873,18 @@ mod tests {
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    #[test]
+    fn dumps_shared_exponent_rgb_with_padded_rows() {
+        let pack = |r: u32, g: u32, b: u32, exp: u32| r | g << 9 | b << 18 | exp << 27;
+        let rows = [pack(256, 128, 64, 16), u32::MAX, pack(0, 256, 128, 15)]
+            .map(u32::to_le_bytes)
+            .concat();
+        assert_eq!(
+            super::to_rgba(67, 1, 2, 8, &rows),
+            Some(vec![255, 127, 63, 255, 0, 127, 63, 255])
+        );
     }
 
     #[test]
