@@ -94,8 +94,10 @@ git clone https://github.com/avatarmanz/VIctory-7900XTX
 cd VIctory-7900XTX
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
+.\scripts\play.ps1 -Exe 'C:\Games\My Copy\game_scarlett_master.exe'
 ```
+
+Replace the example executable and shader archive paths with your own.
 
 The launcher requests light device removal diagnostics (DRED) by default with
 `-Build diag`. DRED requires `--features diagnostics`. For a release binary
@@ -110,7 +112,7 @@ For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
 `amd_fidelityfx_upscaler_dx12.dll`. Use the DirectX 12 upscaler in
 `Kits/FidelityFX/signedbin`. [AMD FSR SDK 2.4.0](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin)
 
-`scripts\play.ps1 -Exe <path> -Fsr4K quality` selects 2560×1440 input for
+`.\scripts\play.ps1 -Exe 'C:\Games\My Copy\game_scarlett_master.exe' -Fsr4K quality` selects 2560×1440 input for
 the retail 1.0.2.1 Series X 4K SDR profile. `balanced` selects 2258×1270
 and `performance` selects 1920×1080. All three output 3840×2160. With
 `victory run` directly, set `VICTORY_FSR_4K` to the preset name.
@@ -132,7 +134,7 @@ name to select it explicitly. With the launcher, pass
 Before the first run, ahead of time (both can be stopped and go on later):
 
 ```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
+.\target\diag\victory.exe shaders 'C:\Games\My Copy\shaders.rpf'   # every shader translated, minutes
 target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
 ```
 
