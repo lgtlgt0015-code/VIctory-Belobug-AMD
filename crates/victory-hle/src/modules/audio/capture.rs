@@ -115,6 +115,50 @@ fn header(frames: u64) -> [u8; 44] {
     h
 }
 
+fn write_silence(mut out: impl Write, mut frames: u64) -> std::io::Result<()> {
+    const CHUNK_FRAMES: u64 = 4096;
+    static SILENCE: [u8; CHUNK_FRAMES as usize * FRAME_BYTES] =
+        [0; CHUNK_FRAMES as usize * FRAME_BYTES];
+    while frames > 0 {
+        let count = frames.min(CHUNK_FRAMES);
+        out.write_all(&SILENCE[..count as usize * FRAME_BYTES])?;
+        frames -= count;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod silence_tests {
+    use super::*;
+
+    #[test]
+    fn a_long_silence_writes_exactly_the_requested_frames_in_blocks() {
+        #[derive(Default)]
+        struct Counter {
+            bytes: usize,
+            largest: usize,
+        }
+        impl Write for Counter {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                assert!(data.iter().all(|&byte| byte == 0));
+                assert_eq!(data.len() % FRAME_BYTES, 0);
+                self.bytes += data.len();
+                self.largest = self.largest.max(data.len());
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut out = Counter::default();
+        write_silence(&mut out, 0).unwrap();
+        assert_eq!(out.bytes, 0);
+        write_silence(&mut out, 100_003).unwrap();
+        assert_eq!(out.bytes, 100_003 * FRAME_BYTES);
+        assert!(out.largest <= 16 * 1024);
+    }
+}
+
 fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: COM calls with parameters built here; buffers are used only
     // between `GetBuffer` and `ReleaseBuffer`.
@@ -198,13 +242,12 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                         ms = (at - written) * 1000 / u64::from(RATE),
                         "audio capture: nothing played"
                     );
-                    let silence = vec![0u8; (at - written) as usize * FRAME_BYTES];
-                    file.write_all(&silence)?;
+                    write_silence(&mut file, at - written)?;
                     written = at;
                 }
                 let bytes = frames as usize * FRAME_BYTES;
                 if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
-                    file.write_all(&vec![0u8; bytes])?;
+                    write_silence(&mut file, u64::from(frames))?;
                 } else {
                     file.write_all(std::slice::from_raw_parts(data, bytes))?;
                 }
