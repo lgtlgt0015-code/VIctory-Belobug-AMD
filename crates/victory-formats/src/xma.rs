@@ -209,6 +209,16 @@ impl Bits<'_> {
         (v << (24 + self.pos % 8) >> 32) as u32
     }
 
+    fn vlc_prefix(&self) -> usize {
+        let bytes = self.data.get(self.pos / 8..).unwrap_or_default();
+        let pair = match bytes {
+            [high, low, ..] => u16::from_be_bytes([*high, *low]),
+            [high] => u16::from_be_bytes([*high, 0]),
+            [] => 0,
+        };
+        ((pair << (self.pos % 8)) >> (16 - VLC_PREFIX_BITS)) as usize
+    }
+
     fn read(&mut self, n: u32) -> u32 {
         if n == 0 {
             return 0;
@@ -235,11 +245,20 @@ impl Bits<'_> {
     }
 }
 
+const VLC_PREFIX_BITS: u32 = 9;
+const VLC_PREFIX_COUNT: usize = 1 << VLC_PREFIX_BITS;
+
+enum VlcPrefix {
+    Symbol { len: u8, symbol: i32 },
+    Search { first: u16, last: u16 },
+}
+
 /// A prefix code built like FFmpeg's `ff_vlc_init_from_lengths`: codes are
 /// handed out in table order, each the next free one of its length.
 struct Vlc {
     /// Left-aligned code, length, symbol; sorted by code.
     codes: Vec<(u32, u8, i32)>,
+    prefix: [VlcPrefix; VLC_PREFIX_COUNT],
 }
 
 impl Vlc {
@@ -250,13 +269,43 @@ impl Vlc {
             codes.push((code as u32, len, symbol));
             code += 1 << (32 - len);
         }
-        Vlc { codes }
+        assert!(codes.len() <= u16::MAX as usize);
+
+        // Each bucket begins with the code that covers its first bit pattern.
+        // A bucket entirely covered by one code does not need a search.
+        let shift = 32 - VLC_PREFIX_BITS;
+        let mut first = 0;
+        let mut last = 0;
+        let prefix = std::array::from_fn(|bucket| {
+            let low = (bucket as u32) << shift;
+            let high = low | (u32::MAX >> VLC_PREFIX_BITS);
+            first += codes[first + 1..].partition_point(|c| c.0 <= low);
+            last = last.max(first);
+            last += codes[last + 1..].partition_point(|c| c.0 <= high);
+            if first == last {
+                let (_, len, symbol) = codes[first];
+                VlcPrefix::Symbol { len, symbol }
+            } else {
+                VlcPrefix::Search {
+                    first: first as u16,
+                    last: last as u16,
+                }
+            }
+        });
+        Vlc { codes, prefix }
     }
 
     fn read(&self, bits: &mut Bits) -> i32 {
-        let v = bits.peek32();
-        let i = self.codes.partition_point(|c| c.0 <= v) - 1;
-        let (_, len, symbol) = self.codes[i];
+        let (len, symbol) = match self.prefix[bits.vlc_prefix()] {
+            VlcPrefix::Symbol { len, symbol } => (len, symbol),
+            VlcPrefix::Search { first, last } => {
+                let v = bits.peek32();
+                let first = first as usize;
+                let next_codes = &self.codes[first + 1..=last as usize];
+                let (_, len, symbol) = self.codes[first + next_codes.partition_point(|c| c.0 <= v)];
+                (len, symbol)
+            }
+        };
         bits.pos += len as usize;
         symbol
     }
@@ -1186,6 +1235,181 @@ mod tests {
             if value >> (n as usize - 1 - i) & 1 == 1 {
                 data[(pos + i) / 8] |= 1 << (7 - (pos + i) % 8);
             }
+        }
+    }
+
+    #[test]
+    fn vlc_matches_the_sorted_codes_at_every_range_boundary() {
+        let tables = codes();
+        for table in [
+            &tables.scale,
+            &tables.scale_rl,
+            &tables.coef[0],
+            &tables.coef[1],
+            &tables.vec4,
+            &tables.vec2,
+            &tables.vec1,
+        ] {
+            // Check both ends of every code interval and every prefix bucket.
+            // The lookup is constant within each intersection of those intervals.
+            let shift = 32 - VLC_PREFIX_BITS;
+            let boundaries = table
+                .codes
+                .iter()
+                .map(|&(code, _, _)| code)
+                .chain((0..VLC_PREFIX_COUNT as u32).map(|prefix| prefix << shift))
+                .chain([u32::MAX]);
+            for boundary in boundaries {
+                for value in [boundary, boundary.saturating_sub(1)] {
+                    let i = table.codes.partition_point(|c| c.0 <= value) - 1;
+                    let (_, len, symbol) = table.codes[i];
+                    for pos in 0..8 {
+                        let mut data = [0; 5];
+                        put_bits(&mut data, pos, 32, value);
+                        let mut bits = Bits {
+                            data: &data,
+                            pos,
+                            end: pos + 32,
+                        };
+                        assert_eq!(table.read(&mut bits), symbol, "lookahead {value:#010x}");
+                        assert_eq!(bits.pos, pos + len as usize, "lookahead {value:#010x}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vlc_prefix_zero_pads_the_end_of_the_input() {
+        for byte in 0..=u8::MAX {
+            let data = [byte];
+            for pos in 0..16 {
+                let bits = Bits {
+                    data: &data,
+                    pos,
+                    end: 8,
+                };
+                assert_eq!(
+                    bits.vlc_prefix(),
+                    (bits.peek32() >> (32 - VLC_PREFIX_BITS)) as usize
+                );
+            }
+        }
+    }
+
+    /// A stereo frame with one full subframe per channel, a flat scale
+    /// factor curve, and a mix of short and long vector coefficient codes.
+    fn coefficient_frame(seed: usize, sparse: bool) -> (Vec<u8>, usize) {
+        let tables = codes();
+        let vectors = |long| {
+            tables
+                .vec4
+                .codes
+                .iter()
+                .copied()
+                .filter(move |&(_, len, symbol)| {
+                    symbol > 0 && (len > VLC_PREFIX_BITS as u8) == long
+                })
+                .collect::<Vec<_>>()
+        };
+        let short = vectors(false);
+        let long = vectors(true);
+        let lookup =
+            |table: &Vlc, symbol| table.codes.iter().copied().find(|c| c.2 == symbol).unwrap();
+        let mut data = vec![0; 2 * PACKET_BYTES];
+        let mut pos = LENGTH_BITS as usize;
+        let mut put = |n, value| {
+            put_bits(&mut data, pos, n, value);
+            pos += n as usize;
+        };
+        let write_code = |put: &mut dyn FnMut(u32, u32), (code, len, _): (u32, u8, i32)| {
+            put(len as u32, code >> (32 - len));
+        };
+
+        put(2, 0b10); // fixed, maximal subframes
+        put(10, 0); // no post-processing, dynamic gain, or trim
+        put(5, 0b00010); // no extended header, reserved bit clear, independent channels
+        put(3, 0b111); // both channels transmit, with explicit vector counts
+        let groups = if sparse { 8 } else { FRAME_SAMPLES / 4 };
+        for _ in 0..2 {
+            put(8, groups as u32);
+        }
+        put(11, 0); // base quantizer, no channel modifiers
+        for _ in 0..2 {
+            put(2, 0);
+            for _ in 0..Decoder::new(2, 48_000).num_sfb[0] {
+                write_code(&mut put, lookup(&tables.scale, 0));
+            }
+        }
+        for channel in 0..2 {
+            put(1, channel as u32); // coefficient table for the run-level tail
+            for group in 0..groups {
+                let pool = if (group + channel + seed).is_multiple_of(4) {
+                    &long
+                } else {
+                    &short
+                };
+                let entry = pool[(group * 17 + channel * 13 + seed) % pool.len()];
+                write_code(&mut put, entry);
+                for shift in [12, 8, 4, 0] {
+                    if (entry.2 >> shift) & 0xf != 0 {
+                        put(1, ((group + shift + channel + seed) & 1) as u32);
+                    }
+                }
+            }
+            if sparse {
+                write_code(&mut put, lookup(&tables.coef[channel], 1)); // end of coefficients
+            }
+        }
+        let len = pos + 2;
+        put_bits(&mut data, 0, LENGTH_BITS, len as u32);
+        data.truncate(len.div_ceil(8));
+        (data, len)
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn vlc_decode_throughput() {
+        use std::{hint::black_box, time::Instant};
+
+        for sparse in [false, true] {
+            let frames: Vec<_> = (0..32)
+                .map(|seed| coefficient_frame(seed, sparse))
+                .collect();
+            let mut decoder = Decoder::new(2, 48_000);
+            let mut out = Vec::with_capacity(2 * FRAME_SAMPLES);
+            let mut checksum = 0u64;
+            for (data, len) in &frames {
+                out.clear();
+                decoder.decode(data, *len, &mut out).unwrap();
+                assert_eq!(out.len(), 2 * FRAME_SAMPLES);
+                for &sample in &out {
+                    checksum = checksum
+                        .wrapping_mul(1_000_003)
+                        .wrapping_add(sample as u16 as u64);
+                }
+            }
+            assert_ne!(checksum, 0);
+
+            let repetitions = 160;
+            let mut rates = [0.0; 7];
+            for rate in &mut rates {
+                decoder.reset();
+                let start = Instant::now();
+                for _ in 0..repetitions {
+                    for (data, len) in &frames {
+                        out.clear();
+                        decoder.decode(black_box(data), *len, &mut out).unwrap();
+                        black_box(&out);
+                    }
+                }
+                *rate = (repetitions * frames.len()) as f64 / start.elapsed().as_secs_f64();
+            }
+            rates.sort_by(f64::total_cmp);
+            println!(
+                "sparse={sparse}: {:.0} frames/s (median of {rates:.0?}), PCM {checksum:016x}",
+                rates[3]
+            );
         }
     }
 
