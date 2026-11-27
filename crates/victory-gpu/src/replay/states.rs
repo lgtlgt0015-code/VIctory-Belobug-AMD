@@ -33,6 +33,7 @@ struct One {
     subs: u32,
     /// Decays to the common state after each submission.
     decays: bool,
+    pending_decay: bool,
     all: u32,
     each: Vec<u32>,
 }
@@ -56,6 +57,7 @@ impl States {
             One {
                 subs: subs.max(1),
                 decays,
+                pending_decay: false,
                 all: state,
                 each: Vec::new(),
             },
@@ -114,15 +116,19 @@ impl States {
                 one.each.clear();
             }
         }
-        if one.decays {
+        if one.decays && !one.pending_decay {
+            one.pending_decay = true;
             self.touched.push(c.res);
         }
     }
 
     /// The end of a submission (one `ExecuteCommandLists`).
     pub fn decay(&mut self) {
-        for res in std::mem::take(&mut self.touched) {
-            if let Some(one) = self.map.get_mut(&res) {
+        for res in self.touched.drain(..) {
+            if let Some(one) = self.map.get_mut(&res)
+                && one.pending_decay
+            {
+                one.pending_decay = false;
                 one.all = COMMON;
                 one.each.clear();
             }
@@ -229,6 +235,30 @@ mod tests {
         assert_eq!(s.get(3), Some(vec![COMMON]));
         s.remove(3);
         assert_eq!(s.get(3), None);
+    }
+
+    #[test]
+    fn repeated_transitions_queue_one_decay_per_texture() {
+        let mut states = States::default();
+        states.add(1, 2, COMMON, true);
+        states.add(2, 1, COMMON, true);
+        states.add(3, 1, COMMON, false);
+        for _ in 0..1024 {
+            states.change(&set(1, 0, COPY_DEST));
+            states.change(&set(1, 1, COPY_SOURCE));
+        }
+        states.change(&set(2, ALL, COPY_DEST));
+        states.change(&set(3, ALL, COPY_SOURCE));
+        assert_eq!(states.get(1), Some(vec![COPY_DEST, COPY_SOURCE]));
+        assert_eq!(states.touched, [1, 2]);
+        states.decay();
+        assert_eq!(states.get(1), Some(vec![COMMON]));
+        assert_eq!(states.get(2), Some(vec![COMMON]));
+        assert_eq!(states.get(3), Some(vec![COPY_SOURCE]));
+        states.change(&set(1, 0, COPY_DEST));
+        assert_eq!(states.touched, [1]);
+        states.decay();
+        assert_eq!(states.get(1), Some(vec![COMMON]));
     }
 
     #[test]
